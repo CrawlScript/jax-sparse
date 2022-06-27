@@ -5,7 +5,7 @@ from setuptools import setup, find_packages
 setup(
     name="jax_sparse",
     python_requires='>3.5.0',
-    version="0.0.1",
+    version="0.0.2",
     author="Jun Hu",
     author_email="hujunxianligong@gmail.com",
     packages=find_packages(
@@ -22,7 +22,7 @@ setup(
         ]
     ),
     install_requires=[
-        "jax >= 0.3.0",
+        "jax >= 0.3.13",
         # "networkx >= 2.1",
         # "scipy >= 1.1.0",
         # "scikit-learn >= 0.22",

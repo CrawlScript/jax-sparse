@@ -13,6 +13,8 @@ import numbers
 from jax.experimental.sparse import BCOO
 from jax.experimental.sparse._base import JAXSparse
 
+from jax_sparse.utils import merge_duplicated_sparse_index
+
 """
 Sparse Matrix for Computation
 """
@@ -298,29 +300,16 @@ class SparseMatrix(JAXSparse):
         output = jax.ops.segment_sum(weighted_repeated_h, row, self.shape[0])
         return output
 
-    # def _matmul_sparse(self, other):
-    #
-    #     if self.is_diag:
-    #         return other.rmatmul_diag(self.value)
-    #     elif other.is_diag:
-    #         return self.matmul_diag(other.value)
-    #
-    #     warnings.warn("The operation \"SparseMatrix @ SparseMatrix\" does not support gradient computation.")
-    #
-    #     csr_matrix_a = self._to_csr_sparse_matrix()
-    #     csr_matrix_b = other._to_csr_sparse_matrix()
-    #
-    #     csr_matrix_c = sparse_matrix_sparse_mat_mul(
-    #         a=csr_matrix_a, b=csr_matrix_b, type=self.value.dtype
-    #     )
-    #
-    #     sparse_tensor_c = csr_sparse_matrix_to_sparse_tensor(
-    #         csr_matrix_c, type=self.value.dtype
-    #     )
-    #
-    #     output_class = self.__class__ if issubclass(self.__class__, other.__class__) else other.__class__
-    #
-    #     return output_class.from_sparse_tensor(sparse_tensor_c, merge=True)
+    def _matmul_sparse(self, other):
+
+        if self.is_diag:
+            return other.rmatmul_diag(self.data)
+        elif other.is_diag:
+            return self.matmul_diag(other.data)
+        else:
+            raise NotImplementedError()
+
+
 
     # sparse_adj @ other
     def matmul(self, other):
@@ -357,14 +346,14 @@ class SparseMatrix(JAXSparse):
     # self @ diagonal_matrix
     def matmul_diag(self, diagonals):
         col = self.index[1]
-        updated_edge_weight = self.data * tf.gather(diagonals, col)
-        return self.__class__(self.index, updated_edge_weight, self._shape)
+        updated_edge_weight = self.data * diagonals[col]
+        return self.__class__(self.index, updated_edge_weight, self.shape)
 
     # self @ diagonal_matrix
     def rmatmul_diag(self, diagonals):
         row = self.index[0]
-        updated_edge_weight = tf.gather(diagonals, row) * self.data
-        return self.__class__(self.index, updated_edge_weight, self._shape)
+        updated_edge_weight = diagonals[row] * self.data
+        return self.__class__(self.index, updated_edge_weight, self.shape)
 
     # self @ other (other is a dense tensor or SparseAdj)
     def __matmul__(self, other):
@@ -374,10 +363,24 @@ class SparseMatrix(JAXSparse):
     def __rmatmul__(self, other):
         return self.rmatmul(other)
 
-    def add_diag(self, diagonals):
-        if tf.rank(diagonals) == 0:
-            diagonals = tf.fill([self.shape[0]], diagonals)
+    def concat_diag(self, diagonals):
+        if jnp.ndim(diagonals) == 0:
+            diagonals = jnp.full([self.shape[0]], diagonals)
 
+        num_rows = self.shape[0]
+        row = jnp.arange(0, num_rows, dtype=jnp.int64)
+        col = row
+        diag_index = jnp.stack([row, col], axis=0)
+
+        return self.__class__(
+            jnp.concatenate([self.index, diag_index], axis=1),
+            jnp.concatenate([self.data, diagonals], axis=0),
+            shape=self.shape
+        )
+
+    def add_diag(self, diagonals):
+        if jnp.ndim(diagonals) == 0:
+            diagonals = jnp.full([self.shape[0]], diagonals)
         diagonal_matrix = self.__class__.from_diagonals(diagonals)
 
         return diagonal_matrix + self
@@ -422,8 +425,8 @@ class SparseMatrix(JAXSparse):
         # edge_index_is_tensor = tf.is_tensor(self.index)
         # edge_weight_is_tensor = tf.is_tensor(self.value)
 
-        combined_index = tf.concat([self.index, other.index], axis=1)
-        combined_value = tf.concat([self.data, other.data], axis=0)
+        combined_index = jnp.concatenate([self.index, other.index], axis=1)
+        combined_value = jnp.concatenate([self.data, other.data], axis=0)
 
         merged_index, [merged_value] = merge_duplicated_sparse_index(
             combined_index, props=[combined_value], merge_modes=[merge_mode])
@@ -435,7 +438,7 @@ class SparseMatrix(JAXSparse):
         #     merged_value = merged_value.numpy()
 
         output_class = self.__class__ if issubclass(self.__class__, other.__class__) else other.__class__
-        merged_sparse_adj = output_class(merged_index, merged_value, shape=self._shape)
+        merged_sparse_adj = output_class(merged_index, merged_value, shape=self.shape)
 
         return merged_sparse_adj
 
@@ -494,10 +497,10 @@ class SparseMatrix(JAXSparse):
         :param diagonals:
         :return:
         """
-        num_rows = tf.shape(diagonals)[0]
-        row = tf.range(0, num_rows, dtype=tf.int32)
+        num_rows = jnp.shape(diagonals)[0]
+        row = jnp.arange(0, num_rows, dtype=jnp.int64)
         col = row
-        index = tf.stack([row, col], axis=0)
+        index = jnp.stack([row, col], axis=0)
         return cls(index, diagonals, shape=[num_rows, num_rows], is_diag=True)
 
     @classmethod
@@ -507,7 +510,7 @@ class SparseMatrix(JAXSparse):
         :param diagonals:
         :return:
         """
-        diagonals = tf.ones([num_rows], dtype=tf.float32)
+        diagonals = jnp.ones([num_rows], dtype=jnp.float64)
         return cls.from_diagonals(diagonals)
 
     # @classmethod
@@ -519,20 +522,22 @@ class SparseMatrix(JAXSparse):
     #         merge=merge
     #     )
 
-    def to_sparse_tensor(self):
+    # def to_sparse_tensor(self):
+    #
+    #     sparse_tensor = tf.sparse.SparseTensor(
+    #         indices=tf.cast(tf.transpose(self.index, [1, 0]), tf.int64),
+    #         values=self.data,
+    #         dense_shape=tf.cast(self._shape, tf.int64)
+    #     )
+    #     # sparse_tensor = tf.sparse.reorder(sparse_tensor)
+    #     return sparse_tensor
 
-        sparse_tensor = tf.sparse.SparseTensor(
-            indices=tf.cast(tf.transpose(self.index, [1, 0]), tf.int64),
-            values=self.data,
-            dense_shape=tf.cast(self._shape, tf.int64)
-        )
-        # sparse_tensor = tf.sparse.reorder(sparse_tensor)
-        return sparse_tensor
+    def todense(self):
+        return self.to_dense()
 
     def to_dense(self):
-        sparse_tensor = self.to_sparse_tensor()
-        sparse_tensor = tf.sparse.reorder(sparse_tensor)
-        return tf.sparse.to_dense(sparse_tensor)
+        bcoo_matrix = jax.experimental.sparse.BCOO((self.data, jnp.transpose(self.index)), shape=self.shape)
+        return bcoo_matrix.todense()
 
     def __str__(self):
         return "SparseMatrix: \n" \
@@ -540,7 +545,7 @@ class SparseMatrix(JAXSparse):
                "{}\n" \
                "value => {}\n" \
                "shape => {}\n" \
-               "is_diag => {}".format(self.index, self.data, self._shape, self.is_diag)
+               "is_diag => {}".format(self.index, self.data, self.shape, self.is_diag)
 
     def __repr__(self):
         return self.__str__()
